@@ -3,4 +3,4 @@ groq==0.11.0
 edge-tts==6.1.12
 python-dotenv==1.0.1
 flask==3.0.3
-libsql-experimental==0.0.42
+libsql-experimental==0.0.55
