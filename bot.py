@@ -116,6 +116,15 @@ def init_db():
                      (session_id TEXT PRIMARY KEY,
                       history TEXT)''')
 
+        c.execute('''CREATE TABLE IF NOT EXISTS mistakes
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      session_id TEXT,
+                      user_id INTEGER,
+                      original_text TEXT,
+                      corrected_text TEXT,
+                      explanation TEXT,
+                      created_at TEXT)''')
+
         _db_conn.commit()
 
 def get_active_session_id(user_id):
@@ -228,6 +237,57 @@ async def generate_voice_bytes(text: str) -> io.BytesIO:
     buffer.seek(0)
     return buffer
 
+MISTAKE_DETECTION_PROMPT = """You are analyzing a single message a language learner wrote in an English conversation practice app. Decide if the message contains a clear English grammar, vocabulary, or word-choice mistake (ignore casual style, contractions, or messages not written in English).
+
+Respond ONLY with valid JSON, no other text, in this exact format:
+{"has_mistake": true or false, "corrected": "the corrected version of the sentence, or empty string if no mistake", "explanation": "a short one-sentence explanation in Uzbek of what was wrong, or empty string if no mistake"}"""
+
+def save_mistake(session_id, user_id, original, corrected, explanation):
+    with _db_lock:
+        c = _db_conn.cursor()
+        c.execute(
+            "INSERT INTO mistakes (session_id, user_id, original_text, corrected_text, explanation, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, user_id, original, corrected, explanation, datetime.now().isoformat())
+        )
+        _db_conn.commit()
+
+def get_mistakes(user_id, limit=15):
+    with _db_lock:
+        c = _db_conn.cursor()
+        c.execute(
+            "SELECT original_text, corrected_text, explanation, created_at FROM mistakes "
+            "WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit)
+        )
+        return c.fetchall()
+
+async def detect_mistake(session_id, user_id, user_text):
+    if not user_text or len(user_text.strip()) < 4:
+        return
+    try:
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=MAIN_MODEL,
+            messages=[
+                {"role": "system", "content": MISTAKE_DETECTION_PROMPT},
+                {"role": "user", "content": user_text}
+            ],
+            max_tokens=200
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'^```json|```$', '', raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+
+        if data.get("has_mistake"):
+            await asyncio.to_thread(
+                save_mistake,
+                session_id, user_id, user_text,
+                data.get("corrected", ""), data.get("explanation", "")
+            )
+    except Exception as e:
+        print(f"⚠️ Mistake detection xatosi: {e}")
+
 # ==========================================
 # 5. KOMANDALAR
 # ==========================================
@@ -241,7 +301,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ovozli javob ham olasiz.\n\n"
         "Buyruqlar:\n"
         "/newchat — yangi suhbat boshlash\n"
-        "/chats — oldingi suhbatlar ro'yxati"
+        "/chats — oldingi suhbatlar ro'yxati\n"
+        "/mistakes — xatolaringiz ro'yxati"
     )
 
 async def cmd_newchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -282,6 +343,24 @@ async def handle_chat_selection(update: Update, context: ContextTypes.DEFAULT_TY
         await asyncio.to_thread(switch_session, user_id, session_id)
         await query.edit_message_text("✅ Suhbat tanlandi. Davom eting — matn yoki ovoz yuboring!")
 
+async def cmd_mistakes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = await asyncio.to_thread(get_mistakes, user_id)
+
+    if not rows:
+        await update.message.reply_text("Hali hech qanday xato qayd etilmagan. Davom eting! 👍")
+        return
+
+    lines = ["📝 <b>So'nggi xatolaringiz:</b>\n"]
+    for original, corrected, explanation, created_at in reversed(rows):
+        lines.append(
+            f"❌ {html.escape(original)}\n"
+            f"✅ {html.escape(corrected)}\n"
+            f"💡 {html.escape(explanation)}\n"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
 # ==========================================
 # 6. ASOSIY XABAR ISHLOVCHI (SPEAKING PARTNER)
 # ==========================================
@@ -320,6 +399,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         history.append({"role": "user", "content": user_text})
+        asyncio.create_task(detect_mistake(session_id, user_id, user_text))
 
         try:
             response = await asyncio.wait_for(
@@ -377,6 +457,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("newchat", cmd_newchat))
     app.add_handler(CommandHandler("chats", cmd_chats))
+    app.add_handler(CommandHandler("mistakes", cmd_mistakes))
     app.add_handler(CallbackQueryHandler(handle_chat_selection, pattern=r"^switch:"))
 
     app.add_handler(MessageHandler(
